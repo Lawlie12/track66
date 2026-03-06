@@ -1,192 +1,478 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>BodyVision HUD - Real-Time Tracking System</title>
+  <meta charset="utf-8" />
+  <title>Advanced Multi-person Real-time Tracker (three.js + TF + MediaPipe)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body { margin:0; overflow:hidden; background:#000; font-family:Arial; }
-    #container { position:relative; width:100vw; height:100vh; }
-    canvas { display:block; }
-    .label { position:absolute; background:rgba(0,0,0,0.75); color:#0ff; padding:4px 8px; border-radius:4px; font-size:12px; pointer-events:none; white-space:nowrap; box-shadow:0 0 10px #0ff; }
+    body { margin:0; overflow:hidden; font-family: Arial, sans-serif; background:#111; color:#eee;}
+    #ui {
+      position: absolute; left: 10px; top: 10px; z-index: 30;
+      background: rgba(0,0,0,0.5); padding:10px; border-radius:6px;
+    }
+    #fps { font-size:13px; }
+    video { display:none; } /* we use video only as source */
+    canvas#overlay {
+      position: absolute; left:0; top:0; z-index:20; pointer-events:none;
+    }
   </style>
 </head>
 <body>
-<div id="container">
-  <video id="video" autoplay playsinline style="display:none"></video>
-  <canvas id="three"></canvas>
-</div>
+  <div id="ui">
+    <button id="startBtn">Start Tracking</button>
+    <span id="fps">fps: --</span>
+    <div style="margin-top:6px; font-size:13px">People tracked: <span id="peopleCount">0</span></div>
+  </div>
 
-<script type="module">
-import * as THREE from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js';
+  <video id="video" autoplay playsinline></video>
+  <canvas id="overlay"></canvas>
 
-// ============== MEDIA PIPE SETUP ==============
-let poseLandmarker, faceLandmarker, video, canvas, ctx, scene, camera, renderer;
-let labels = {}; // DOM labels attached to parts
+  <!-- THREE.js -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.154.0/build/three.min.js"></script>
 
-const POSE_CONNECTIONS = [[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,25],[24,26],[25,27],[26,28],[27,31],[28,32]]; // simplified skeleton
+  <!-- TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.12.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@0.0.7/dist/pose-detection.min.js"></script>
 
-async function initMediaPipe() {
-  const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
-  const { FilesetResolver, PoseLandmarker, FaceLandmarker } = vision;
+  <!-- MediaPipe FaceMesh & Hands (via CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.5/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js"></script>
 
-  const fileset = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-  );
+  <script>
+  /* ============================
+     Config / Globals
+     ============================ */
+  const video = document.getElementById('video');
+  const overlay = document.getElementById('overlay');
+  const ctx = overlay.getContext('2d');
+  const startBtn = document.getElementById('startBtn');
+  const fpsEl = document.getElementById('fps');
+  const peopleCountEl = document.getElementById('peopleCount');
 
-  poseLandmarker = await PoseLandmarker.createFromOptions(fileset, {
-    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task" },
-    runningMode: "VIDEO",
-    numPoses: 3
+  let detector = null;
+  let running = false;
+  let lastTs = performance.now();
+  let frames = 0;
+  let lastFpsTime = performance.now();
+
+  // three.js scene
+  let renderer, scene, camera, threeCanvas;
+  const personObjects = new Map(); // key: assigned id, value: {group, lastKeypoints,...}
+
+  const MAX_POSES = 5; // adjustable
+
+  /* ============================
+     Utilities
+     ============================ */
+
+  function now() { return performance.now(); }
+
+  function setupThree() {
+    threeCanvas = document.createElement('canvas');
+    threeCanvas.style.position = 'absolute';
+    threeCanvas.style.left = '0';
+    threeCanvas.style.top = '0';
+    threeCanvas.style.zIndex = 15;
+    document.body.appendChild(threeCanvas);
+
+    renderer = new THREE.WebGLRenderer({ canvas: threeCanvas, alpha: true, antialias:true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    scene = new THREE.Scene();
+
+    camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 1000);
+    camera.position.set(0,0,500);
+    window.addEventListener('resize', onResize);
+    onResize();
+
+    // Add simple ambient
+    const light = new THREE.AmbientLight(0xffffff, 1.0);
+    scene.add(light);
+  }
+
+  function onResize() {
+    overlay.width = window.innerWidth;
+    overlay.height = window.innerHeight;
+    if(renderer) {
+      renderer.setSize(window.innerWidth, window.innerHeight, false);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    }
+  }
+
+  function createPersonObject(id) {
+    // group that holds spheres/lines for skeleton
+    const g = new THREE.Group();
+    g.name = "person-" + id;
+    scene.add(g);
+    // create point spheres for keypoints (we'll create 33 max)
+    const maxPoints = 33;
+    const points = [];
+    for(let i=0;i<maxPoints;i++){
+      const geo = new THREE.SphereGeometry(4,8,8);
+      const mat = new THREE.MeshBasicMaterial({ color: 0x00ffcc });
+      const m = new THREE.Mesh(geo, mat);
+      m.visible = false;
+      g.add(m);
+      points.push(m);
+    }
+    // a line for skeleton (simple)
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(maxPoints*3), 3));
+    const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color:0x00aaff }));
+    g.add(line);
+
+    const infoSprite = createLabelSprite("id:"+id);
+    infoSprite.position.set(0,-80,0);
+    g.add(infoSprite);
+
+    return { group: g, points, line, infoSprite, lastSeen: now(), id };
+  }
+
+  function createLabelSprite(text) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256; canvas.height = 64;
+    const c = canvas.getContext('2d');
+    c.fillStyle = 'rgba(0,0,0,0.6)';
+    c.fillRect(0,0,canvas.width, canvas.height);
+    c.fillStyle = 'white';
+    c.font = '20px Arial';
+    c.fillText(text, 8, 36);
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(160,40,1);
+    return sprite;
+  }
+
+  function updateLabelSprite(sprite, text) {
+    const canvas = sprite.material.map.image;
+    const c = canvas.getContext('2d');
+    c.clearRect(0,0,canvas.width,canvas.height);
+    c.fillStyle='rgba(0,0,0,0.6)';
+    c.fillRect(0,0,canvas.width,canvas.height);
+    c.fillStyle='white'; c.font='18px Arial';
+    wrapText(c, text, 8, 20, canvas.width - 16, 20);
+    sprite.material.map.needsUpdate = true;
+  }
+
+  function wrapText(ctx, text, x, y, maxWidth, lineHeight) {
+    const words = text.split(' ');
+    let line = '';
+    for (let n = 0; n < words.length; n++) {
+      const testLine = line + words[n] + ' ';
+      const metrics = ctx.measureText(testLine);
+      const testWidth = metrics.width;
+      if (testWidth > maxWidth && n > 0) {
+        ctx.fillText(line, x, y);
+        line = words[n] + ' ';
+        y += lineHeight;
+      } else {
+        line = testLine;
+      }
+    }
+    ctx.fillText(line, x, y);
+  }
+
+  /* ============================
+     Inference heuristics (simple)
+     ============================ */
+
+  function computeMouthOpenness(faceLandmarks) {
+    // Use distance between upper lip and lower lip landmarks (approx)
+    // FaceMesh indices: upper lip ~13, lower lip ~14 (approx relative indices depend on version).
+    if(!faceLandmarks || faceLandmarks.length < 20) return 0;
+    const upper = faceLandmarks[13];
+    const lower = faceLandmarks[14];
+    const dx = upper.x - lower.x;
+    const dy = upper.y - lower.y;
+    return Math.hypot(dx, dy);
+  }
+
+  function computeHandRaised(poseKeypoints, side='left') {
+    // check if wrist y < shoulder y (remember y increases down the image)
+    const keyByName = {};
+    for(const k of poseKeypoints) keyByName[k.name||k.keypoint||k.part] = k;
+    const wrist = side==='left' ? keyByName['left_wrist'] : keyByName['right_wrist'];
+    const shoulder = side==='left' ? keyByName['left_shoulder'] : keyByName['right_shoulder'];
+    if(!wrist || !shoulder) return false;
+    return wrist.y < shoulder.y; // smaller y is higher
+  }
+
+  function inferAction(personState) {
+    // personState contains pose keypoints (array), faceLandmarks, handsLandmarks, movementVelocity
+    const { pose, face, hands, velocity } = personState;
+    // Walking detection: significant horizontal velocity on hips/ankles
+    let possible = [];
+    if(velocity && velocity > 1.2) possible.push('moving');
+    // waving: if one hand oscillates up/down near shoulder
+    if(hands && hands.length){
+      for(const h of hands) {
+        const w = h[0]; // wrist idx 0 for mediapipe results
+        if(w && w.y < 0.6) { possible.push('hand-up'); break; }
+      }
+    }
+    // talking: mouth openness > threshold
+    const mouthOpen = face ? computeMouthOpenness(face) : 0;
+    if(mouthOpen > 0.03) possible.push('talking');
+
+    // prioritize:
+    if(possible.includes('hand-up') && possible.includes('talking')) return 'gesturing & speaking';
+    if(possible.includes('hand-up')) return 'waving/hand-up';
+    if(possible.includes('moving')) return 'moving/walking';
+    if(possible.includes('talking')) return 'talking';
+    return 'idle/standing';
+  }
+
+  /* ============================
+     MediaPipe setup
+     ============================ */
+
+  // We'll create a FaceMesh and Hands instance and feed cropped person images to them.
+  const faceMesh = new FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.5/${file}`});
+  faceMesh.setOptions({maxNumFaces:1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5});
+  let faceResultsCache = new Map(); // map personId -> last face landmarks
+
+  const handsSolution = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}`});
+  handsSolution.setOptions({maxNumHands:2, minDetectionConfidence:0.5, minTrackingConfidence:0.5});
+  let handsResultsCache = new Map();
+
+  faceMesh.onResults((results)=>{
+    // results.multiFaceLandmarks is an array
+    // We'll not directly know which person; we will store on a temporary global key set by caller
+    if(faceMesh._callerPersonId) {
+      faceResultsCache.set(faceMesh._callerPersonId, results.multiFaceLandmarks[0] || null);
+      faceMesh._callerPersonId = null;
+    }
   });
 
-  faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
-    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker.task" },
-    runningMode: "VIDEO",
-    numFaces: 3,
-    outputFaceBlendshapes: true
+  handsSolution.onResults((results)=>{
+    if(handsSolution._callerPersonId) {
+      handsResultsCache.set(handsSolution._callerPersonId, results.multiHandLandmarks || []);
+      handsSolution._callerPersonId = null;
+    }
   });
-}
 
-// ============== THREE.JS + VIDEO BACKGROUND ==============
-function initThree() {
-  canvas = document.getElementById('three');
-  renderer = new THREE.WebGLRenderer({ canvas, alpha: false });
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  /* ============================
+     Camera + TF Detector init
+     ============================ */
 
-  scene = new THREE.Scene();
-  camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
-  camera.position.z = 3;
+  async function startCamera() {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width:1280, height:720 }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    onResize();
+  }
 
-  // Video texture plane
-  const videoTexture = new THREE.VideoTexture(video);
-  const plane = new THREE.Mesh(
-    new THREE.PlaneGeometry(4, 3),
-    new THREE.MeshBasicMaterial({ map: videoTexture, side: THREE.DoubleSide })
-  );
-  scene.add(plane);
-}
+  async function initDetector() {
+    // using pose-detection MoveNet MultiPose via tfjs
+    const model = poseDetection.SupportedModels.MoveNet;
+    const detectorConfig = {
+      modelType: poseDetection.movenet.modelType.MULTIPOSE_LIGHTNING,
+      enableSmoothing: true,
+      maxPoses: MAX_POSES
+    };
+    detector = await poseDetection.createDetector(model, detectorConfig);
+    console.log('Detector ready', detector);
+  }
 
-// ============== HELPER: CALCULATE ANGLE ==============
-function calculateAngle(a, b, c) {
-  const ba = new THREE.Vector3().subVectors(a, b);
-  const bc = new THREE.Vector3().subVectors(c, b);
-  return Math.acos(ba.dot(bc) / (ba.length() * bc.length())) * (180 / Math.PI);
-}
+  /* ============================
+     Main loop
+     ============================ */
 
-// ============== ACTIVITY INFERENCE ==============
-function getActivity(poseLandmarks) {
-  if (!poseLandmarks) return "Unknown";
-  const leftHip = poseLandmarks[23];
-  const leftKnee = poseLandmarks[25];
-  const leftAnkle = poseLandmarks[27];
-  const kneeAngle = calculateAngle(leftHip, leftKnee, leftAnkle);
+  async function processFrame() {
+    if(!running) return;
+    const t0 = now();
+    // estimate poses
+    let poses = [];
+    try {
+      poses = await detector.estimatePoses(video, {flipHorizontal: true});
+    } catch(e) {
+      console.error('pose estimation error', e);
+    }
+    peopleCountEl.innerText = poses.length;
 
-  const leftWristY = poseLandmarks[15]?.y || 1;
-  const leftShoulderY = poseLandmarks[11]?.y || 1;
+    // update / create three.js objects per detected pose
+    // we'll use pose.id if present, else assign incremental id
+    let assignedIds = new Set();
+    for(let i=0;i<poses.length;i++){
+      const p = poses[i];
+      // create a stable id using bbox center rounded
+      const bbox = estimateBoundingBoxFromKeypoints(p.keypoints);
+      const stableId = 'p'+Math.round(bbox.x*100)+'_'+Math.round(bbox.y*100);
+      assignedIds.add(stableId);
+      if(!personObjects.has(stableId)) {
+        const obj = createPersonObject(stableId);
+        personObjects.set(stableId, obj);
+      }
+      const personObj = personObjects.get(stableId);
+      personObj.lastSeen = now();
 
-  if (kneeAngle < 130) return "Sitting";
-  if (leftWristY < leftShoulderY - 0.2) return "Waving / Raising hand";
-  return "Standing";
-}
+      // Update 3D points from keypoints
+      updateThreeFromKeypoints(personObj, p.keypoints, bbox);
 
-// ============== MAIN LOOP ==============
-let lastVideoTime = -1;
-async function loop() {
-  if (video.currentTime !== lastVideoTime) {
-    const now = performance.now();
+      // For each person, crop face/hand area and run mediapipe async
+      // prepare crop canvas
+      const crop = cropFromBBox(video, bbox, 1.3); // scale factor
+      // request face/hands detection (set caller id so callback stores result in cache)
+      faceMesh._callerPersonId = stableId;
+      await faceMesh.send({image: crop});
+      handsSolution._callerPersonId = stableId;
+      await handsSolution.send({image: crop});
 
-    const poseResults = poseLandmarker.detectForVideo(video, now);
-    const faceResults = faceLandmarker.detectForVideo(video, now);
+      // gather cached face/hands if available
+      const faceLandmarks = faceResultsCache.get(stableId) || null;
+      const handsLandmarks = handsResultsCache.get(stableId) || [];
 
-    // Clear previous labels
-    Object.values(labels).forEach(l => l.style.opacity = '0');
+      // compute velocity (simple) and store for inference
+      if(!personObj._state) personObj._state = { prevCenter: {x: bbox.x, y: bbox.y}, velocity:0 };
+      const dx = bbox.x - personObj._state.prevCenter.x;
+      const dy = bbox.y - personObj._state.prevCenter.y;
+      const vel = Math.hypot(dx, dy) * 30; // scale
+      personObj._state.prevCenter = {x: bbox.x, y: bbox.y};
+      personObj._state.velocity = 0.8* (personObj._state.velocity||0) + 0.2*vel;
 
-    // Process every detected person
-    if (poseResults.landmarks) {
-      poseResults.landmarks.forEach((pose, personIdx) => {
-        const activity = getActivity(pose);
-        const headPos = {x: pose[0].x * canvas.width, y: pose[0].y * canvas.height};
-
-        // Activity label above head
-        let actLabel = labels[`act${personIdx}`] || createLabel(`Activity: ${activity}`, headPos.x, headPos.y - 60, '#0f0');
-        actLabel.textContent = `Activity: ${activity}`;
-        actLabel.style.opacity = '1';
-        labels[`act${personIdx}`] = actLabel;
-
-        // Example stats on specific parts
-        // Left eye (approximate from face + pose)
-        if (faceResults.faceBlendshapes && faceResults.faceBlendshapes[personIdx]) {
-          const bs = faceResults.faceBlendshapes[personIdx];
-          const eyeBlink = bs.find(b => b.categoryName === 'eyeBlinkLeft')?.score || 0;
-          const jawOpen = bs.find(b => b.categoryName === 'jawOpen')?.score || 0;
-
-          const eyeLabel = labels[`eyeL${personIdx}`] || createLabel("", pose[1].x*canvas.width, pose[1].y*canvas.height - 30);
-          eyeLabel.textContent = `Eye: ${eyeBlink > 0.5 ? 'Closed' : 'Open'} | Gaze tracked`;
-          eyeLabel.style.opacity = '1';
-          labels[`eyeL${personIdx}`] = eyeLabel;
-
-          const jawLabel = labels[`jaw${personIdx}`] || createLabel("", pose[0].x*canvas.width - 40, pose[0].y*canvas.height + 30);
-          jawLabel.textContent = `Jaw open: ${(jawOpen*100).toFixed(0)}%`;
-          jawLabel.style.opacity = '1';
-          labels[`jaw${personIdx}`] = jawLabel;
-        }
-
-        // Elbow angle example
-        const elbowAngle = calculateAngle(pose[11], pose[13], pose[15]);
-        const elbowLabel = labels[`elb${personIdx}`] || createLabel("", pose[13].x*canvas.width, pose[13].y*canvas.height);
-        elbowLabel.textContent = `Elbow: ${elbowAngle.toFixed(0)}°`;
-        elbowLabel.style.opacity = '1';
-        labels[`elb${personIdx}`] = elbowLabel;
-
-        // Neck tilt (rough)
-        const neckTilt = Math.abs(pose[0].y - pose[1].y) * 100;
-        const neckLabel = labels[`neck${personIdx}`] || createLabel("", pose[1].x*canvas.width, pose[1].y*canvas.height - 20);
-        neckLabel.textContent = `Neck tilt: ${neckTilt.toFixed(0)}`;
-        neckLabel.style.opacity = '1';
-        labels[`neck${personIdx}`] = neckLabel;
-      });
+      // update label with stats & inference
+      const pstate = { pose: p.keypoints, face: faceLandmarks, hands: handsLandmarks, velocity: personObj._state.velocity };
+      const action = inferAction(pstate);
+      const labelText = `id:${stableId}\nact: ${action}\nvel:${personObj._state.velocity.toFixed(2)}\nface:${faceLandmarks ? 'yes':'no'}\nhands:${handsLandmarks.length}`;
+      updateLabelSprite(personObj.infoSprite, labelText);
     }
 
-    lastVideoTime = video.currentTime;
+    // remove stale person objects
+    for(const [id, obj] of personObjects.entries()){
+      if(!assignedIds.has(id) && now() - obj.lastSeen > 2000) {
+        // fade out and remove
+        scene.remove(obj.group);
+        personObjects.delete(id);
+      }
+    }
+
+    // draw overlay 2D (debug)
+    drawOverlay(poses);
+
+    // three.js render
+    renderer.render(scene, camera);
+
+    // fps
+    frames++;
+    const t1 = now();
+    if(t1 - lastFpsTime > 500) {
+      const fps = Math.round((frames*1000) / (t1 - lastFpsTime));
+      fpsEl.innerText = 'fps: '+fps;
+      frames = 0; lastFpsTime = t1;
+    }
+
+    requestAnimationFrame(processFrame);
   }
 
-  renderer.render(scene, camera);
-  requestAnimationFrame(loop);
-}
+  /* ============================
+     Helper functions for keypoints / three.js
+     ============================ */
 
-function createLabel(text, x, y, color = '#0ff') {
-  const div = document.createElement('div');
-  div.className = 'label';
-  div.style.left = `${x}px`;
-  div.style.top = `${y}px`;
-  div.style.color = color;
-  div.textContent = text;
-  document.getElementById('container').appendChild(div);
-  return div;
-}
-
-// ============== START ==============
-async function start() {
-  video = document.getElementById('video');
-  await initMediaPipe();
-  initThree();
-
-  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
-  video.srcObject = stream;
-  await video.play();
-
-  loop();
-}
-
-start().catch(console.error);
-
-window.addEventListener('resize', () => {
-  if (renderer) {
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
+  function estimateBoundingBoxFromKeypoints(keypoints) {
+    // keypoints: array with {x,y,score}
+    let minX=1,minY=1,maxX=0,maxY=0;
+    for(const k of keypoints){
+      if(k.score && k.score < 0.2) continue;
+      minX = Math.min(minX, k.x);
+      minY = Math.min(minY, k.y);
+      maxX = Math.max(maxX, k.x);
+      maxY = Math.max(maxY, k.y);
+    }
+    // values are normalized (0..1) in tf pose models; convert to pixels
+    return {
+      x: (minX+maxX)/2 * video.videoWidth,
+      y: (minY+maxY)/2 * video.videoHeight,
+      w: Math.max(64,(maxX-minX)*video.videoWidth),
+      h: Math.max(64,(maxY-minY)*video.videoHeight)
+    };
   }
-});
-</script>
+
+  function cropFromBBox(sourceVideo, bbox, scale=1.2) {
+    const c = document.createElement('canvas');
+    const sx = Math.max(0, bbox.x - bbox.w/2 * scale);
+    const sy = Math.max(0, bbox.y - bbox.h/2 * scale);
+    const sw = Math.min(sourceVideo.videoWidth - sx, bbox.w * scale);
+    const sh = Math.min(sourceVideo.videoHeight - sy, bbox.h * scale);
+    c.width = sw; c.height = sh;
+    const cc = c.getContext('2d');
+    cc.drawImage(sourceVideo, sx, sy, sw, sh, 0, 0, sw, sh);
+    return c;
+  }
+
+  function updateThreeFromKeypoints(personObj, keypoints, bbox) {
+    // map 2D keypoints to three.js positions
+    // Use normalized coords from detector (0..1) -> screen pixels -> three.js coords
+    const w = overlay.width, h = overlay.height;
+    const pts = personObj.points;
+    const positions = personObj.line.geometry.attributes.position.array;
+    let idx = 0;
+    for(let i=0;i<pts.length;i++){
+      const k = keypoints[i];
+      if(k && k.score > 0.2) {
+        const sx = k.x * w;
+        const sy = k.y * h;
+        pts[i].position.set((sx - w/2), -(sy - h/2), 0);
+        pts[i].visible = true;
+        positions[idx++] = (sx - w/2);
+        positions[idx++] = -(sy - h/2);
+        positions[idx++] = 0;
+      } else {
+        pts[i].visible = false;
+        positions[idx++] = 0; positions[idx++] = 0; positions[idx++] = 0;
+      }
+    }
+    personObj.line.geometry.attributes.position.needsUpdate = true;
+    // update label position near the head
+    const headX = bbox.x / video.videoWidth * w;
+    const headY = bbox.y / video.videoHeight * h;
+    personObj.infoSprite.position.set((headX - w/2), -(headY - h/2) - 60, 0);
+  }
+
+  function drawOverlay(poses) {
+    ctx.clearRect(0,0,overlay.width, overlay.height);
+    ctx.save();
+    ctx.scale(overlay.width/video.videoWidth, overlay.height/video.videoHeight); // normalize to video pixels
+    // draw bounding boxes & skeletons
+    for(const p of poses) {
+      const bbox = estimateBoundingBoxFromKeypoints(p.keypoints);
+      ctx.strokeStyle = 'rgba(0,200,255,0.8)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bbox.x - bbox.w/2, bbox.y - bbox.h/2, bbox.w, bbox.h);
+
+      // keypoints
+      for(const k of p.keypoints) {
+        if(k.score > 0.3) {
+          ctx.fillStyle = 'rgba(255,255,255,0.9)';
+          ctx.beginPath();
+          ctx.arc(k.x * video.videoWidth, k.y * video.videoHeight, 6, 0, Math.PI*2);
+          ctx.fill();
+        }
+      }
+    }
+    ctx.restore();
+  }
+
+  /* ============================
+     Start / Stop handlers
+     ============================ */
+
+  startBtn.addEventListener('click', async ()=>{
+    if(running) { running=false; startBtn.innerText='Start Tracking'; return; }
+    startBtn.disabled = true;
+    startBtn.innerText = 'Starting...';
+    await startCamera();
+    setupThree();
+    await initDetector();
+    startBtn.innerText = 'Stop Tracking';
+    startBtn.disabled = false;
+    running = true;
+    processFrame();
+  });
+
+  // initialize mediapipe (must be after page load)
+  // nothing else required here; faceMesh and hands were configured earlier.
+
+  </script>
 </body>
 </html>
